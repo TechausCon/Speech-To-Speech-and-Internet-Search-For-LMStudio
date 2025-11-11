@@ -22,10 +22,15 @@ uses
   uWVTypes, uWVConstants, uWVTypeLibrary,
   uWVLibFunctions, uWVLoader, uWVInterfaces, uWVCoreWebView2Args,
   uWVCoreWebView2SharedBuffer, Vcl.ExtCtrls, Vcl.Imaging.GIFImg,
-  Vcl.Imaging.pngimage, System.IOUtils, Inifiles;
+  Vcl.Imaging.pngimage, System.IOUtils, Inifiles, System.Generics.Collections;
 
 
 type
+  TChatMessage = record
+    Role: string;
+    Content: string;
+  end;
+
   TForm1 = class(TForm)
      // Network components
     IdSSLIOHandlerSocketOpenSSL1: TIdSSLIOHandlerSocketOpenSSL;
@@ -143,7 +148,8 @@ type
 
 
   private
-     Conversation:String;  // Chat History
+     ConversationHistory: TList<TChatMessage>;  // Chat History
+     PendingInternetResponse: string;
 
      MyShowMessage: Boolean; // We do not want to show the message in the chat window if we are sending the text extracted from a webpage and asking for a summerization
      PanelVisible:Boolean;   // Flash Green Panel When Requesting Internet Accesss
@@ -152,6 +158,8 @@ type
      PromptThread: TThread;  // Global thread variable allows us to kill the thread when Cancel Button is clicked
     function ParseContentFromJSON(const JSONResponse: string): string;
     function GetUrl(const Response: string): string;
+    function BuildRequestPayload(const SystemPrompt, Prompt: string): string;
+    procedure AddConversationMessage(const Role, Content: string);
    protected
 
     procedure WMMove(var aMessage : TWMMove); message WM_MOVE;
@@ -164,6 +172,7 @@ type
     GlobalResponse:String; // Global string to hold response from server
     TTStatus:String;       // Status Of TTS  speaking / ready etc
     Initializing : Boolean;  //  used for when loading settings when app starts
+    destructor Destroy; override;
   end;
 
 
@@ -227,47 +236,6 @@ procedure TForm1.ExecuteJavaScript(const JavaScriptCode: string);
   WVBrowser1.ExecuteScript(JavaScriptCode);
   end;
 //------------------------------------------------------------------------------
-// Stop certain characters messing up the prompt being sent
-function JsonEscape(const Value: string): string;
-var
-  I: Integer;
-  Ch: Char;
-  IsEscaped: Boolean;
-begin
-  Result := '';
-  IsEscaped := False;
-  for I := 1 to Length(Value) do
-  begin
-    Ch := Value[I];
-    if IsEscaped then
-    begin
-      Result := Result + Ch;
-      IsEscaped := False;
-    end
-    else if Ch = '\' then
-    begin
-      Result := Result + '%5C';
-      IsEscaped := True;
-    end
-    else
-    begin
-      case Ch of
-        '"': Result := Result + '';
-        '/': Result := Result + '/';
-        #8: Result := Result + ' ';
-        #9: Result := Result + ' ';
-        #10: Result := Result + ' ';
-        #12: Result := Result + ' ';
-        #13: Result := Result + ' ';
-        else
-          if (Ch < ' ') or (Ch > '~') then
-            Result := Result + '\u' + IntToHex(Ord(Ch), 4)
-          else
-            Result := Result + Ch;
-      end;
-    end;
-  end;
-end;
 //------------------------------------------------------------------------------
 //============================  Start Chat  ====================================
 procedure TForm1.Button1Click(Sender: TObject);
@@ -293,71 +261,101 @@ end;
 End;
 //-----------------------------------------------------------------------------
 
+procedure TForm1.AddConversationMessage(const Role, Content: string);
+var
+  Message: TChatMessage;
+begin
+  if ConversationHistory = nil then
+    Exit;
+
+  Message.Role := Role;
+  Message.Content := Content;
+  ConversationHistory.Add(Message);
+end;
+//-----------------------------------------------------------------------------
+
+function TForm1.BuildRequestPayload(const SystemPrompt, Prompt: string): string;
+var
+  RootObject: TJSONObject;
+  MessagesArray: TJSONArray;
+  MessageObject: TJSONObject;
+  ChatMessage: TChatMessage;
+begin
+  RootObject := TJSONObject.Create;
+  try
+    RootObject.AddPair('model', '''''');
+
+    MessagesArray := TJSONArray.Create;
+    RootObject.AddPair('messages', MessagesArray);
+
+    MessageObject := TJSONObject.Create;
+    MessageObject.AddPair('role', 'system');
+    MessageObject.AddPair('content', SystemPrompt);
+    MessagesArray.AddElement(MessageObject);
+
+    if ConversationHistory <> nil then
+      for ChatMessage in ConversationHistory do
+      begin
+        MessageObject := TJSONObject.Create;
+        MessageObject.AddPair('role', ChatMessage.Role);
+        MessageObject.AddPair('content', ChatMessage.Content);
+        MessagesArray.AddElement(MessageObject);
+      end;
+
+    MessageObject := TJSONObject.Create;
+    MessageObject.AddPair('role', 'user');
+    MessageObject.AddPair('content', Prompt);
+    MessagesArray.AddElement(MessageObject);
+
+    RootObject.AddPair('temperature', TJSONNumber.Create(0.7));
+    RootObject.AddPair('max_tokens', TJSONNumber.Create(-1));
+    RootObject.AddPair('stream', TJSONBool.Create(False));
+
+    Result := RootObject.ToJSON;
+  finally
+    RootObject.Free;
+  end;
+end;
+//-----------------------------------------------------------------------------
+
 // Start thread that posts prompt to the LMStudio Server
 
 procedure TForm1.SendPrompt(const Prompt: string);
-
 var
-  JsonToSend: string;
+  RequestPayload: string;
   StringStream: TStringStream;
-  Response: string;
-  EscapedTextToSend: string;
+  ResponseJSON: string;
+  ResponseText: string;
+  DisplayResponse: string;
   SystemPrompt: string;
-  ParseMarker:integer;
-  SummerizedText:String;
-  addconvo:Boolean;
+  ParseMarker: Integer;
+  SummaryText: string;
+  ShouldRequestInternet: Boolean;
+  ShouldAddSummary: Boolean;
+  AddConversation: Boolean;
+  ResponseForInternet: string;
+  AddPromptToHistory: Boolean;
 begin
-addconvo:=True;
-SystemPrompt := Memo4.Text;
+  AddConversation := True;
+  AddPromptToHistory := Pos('<Instruction>', Prompt) = 0;
+  SystemPrompt := Memo4.Text;
 
+  TThread.Synchronize(nil,
+    procedure
+    begin
+      if MyShowMessage then
+      begin
+        Memo1.Lines.Add('User: ' + Prompt);
+        Memo1.Lines.Add('');
+      end;
+      MyShowMessage := True;
+      Memo3.Clear;
+      Application.ProcessMessages;
+    end);
 
- // We do not want to show the message in the chat window if we are sending the text extracted from a webpage and asking for a summerization
- if MyShowMessage then
-   Begin
-  Memo1.Lines.Add('User: ' + Prompt);
-  Memo1.Lines.Add('');
-   End;
+  RequestPayload := BuildRequestPayload(SystemPrompt, Prompt);
 
-  MyShowMessage:=True;
-  Conversation := JsonEscape(Conversation);
-  EscapedTextToSend := JsonEscape(Prompt);
-
-  // If there is no chat history  just send prompt
- if length(Conversation) < 2 then
-    JsonToSend := '{' +
-      '"model": "''",' +
-      '"messages": [' +
-      '  { "role": "system", "content": "' + JsonEscape(SystemPrompt) + '" },' +
-      '  { "role": "user", "content": "' + EscapedTextToSend + '" }' +
-      '],' +
-      '"temperature": 0.7,' +
-      '"max_tokens": -1,' +
-      '"stream": false' +
-      '}' ;
-
-      // If there is chat history append chat history to prompt
-  if length(Conversation) > 2 then
-    JsonToSend := '{' +
-     '"model": "''",' +
-      '"messages": [' +
-      '  { "role": "system", "content": "' + JsonEscape(SystemPrompt) + '" },' +
-      '  { "role": "user", "content": "Conversation History To be used as reference only, ' +
-      'do not mention it in your response: ' + Conversation + ' | End of Conversation History. ' +
-      'Now respond to the users last input: ' + EscapedTextToSend + '" }' +
-      '],' +
-      '"temperature": 0.7,' +
-      '"max_tokens": -1,' +
-      '"stream": false' +
-      '}';
-
-
-   // If we are not asking to summerize text from websearch Append new Prompt to chat history
-   // Should add AI side of conversation too ??
-
-   Memo3.Clear;
-   Application.ProcessMessages;
-  Conversation := JsonEscape(Conversation);
-  StringStream := TStringStream.Create(JsonToSend, TEncoding.UTF8);
+  StringStream := TStringStream.Create(RequestPayload, TEncoding.UTF8);
   try
     IdHTTP1.Request.ContentType := 'application/json';
     IdHTTP1.ReadTimeout := 600000; // 60 seconds
@@ -367,128 +365,95 @@ SystemPrompt := Memo4.Text;
     IdHTTP1.Request.Accept := 'text/event-stream';
 
     try
-
-      Response := IdHTTP1.Post(Edit1.Text, StringStream);
-      //Memo2.Lines.Add(Response);
-      Response := ParseContentFromJSON(Response);
-
-      // Hide "Processing Webpage" Label and  Animated Image
-      Label1.Visible:=False;
-      Image1.Visible:=False;
-
-      //Enabled Send Prompt & New Chat Button & Browser
-      Button1.Enabled:=True;
-      Button2.Enabled:=True;
-      Button6.Visible:=False; // Cancel Button
-      WVWindowParent1.Enabled:=True;
-
-
-      Response := StringReplace(Response, '</Iinternet>', '</Internet>', [rfReplaceAll]); // Llama 3.1 8B Q8 Likes to do this ?
-      Response := StringReplace(Response, '<Iinternet>', '<Internet>', [rfReplaceAll]); // Llama 3.1 8B Q8 Likes to do this ?
-      Response := StringReplace(Response, '<Iternet>', '<Internet>', [rfReplaceAll]); // Llama 3.1 8B Q8 Likes to do this ?
-      Response := StringReplace(Response, '</Iternet>', '</Internet>', [rfReplaceAll]); // Llama 3.1 8B Q8 Likes to do this ?
-      Response := StringReplace(Response, '</internet>', '</Internet>', [rfReplaceAll]); // Llama 3.1 8B Q8 Likes to do this ?
-      Response := StringReplace(Response, '<internet>', '<Internet>', [rfReplaceAll]); // Llama 3.1 8B Q8 Likes to do this ?
-
-
-      //  Check If <Internet> Tag is in Response
-      if (Pos('<Internet>', Response) > 0) and (Pos('</Internet>', Response) > 0) then
-
-      begin
-                                                                           // Only continue if the <Internet> is NOT in a summerization
-            if (Pos('I found this on the Internet:', Response) = 0) then   // do not open urls in sumerizations can cause a loop
-
-
-
-      Begin
-         GlobalResponse:=Response;
-
-        // Request Internet Access
-        if Not PermanentAccess then
-        begin
-        Application.ProcessMessages;
-        Timer2.Enabled:=True;
-        end;
-
-
-        // No Need To Request Access
-        if  PermanentAccess then
-        begin
-        // Execute in Timer because of threading
-        Timer3.Enabled:=True;
-        end;
-
-       end;
-
-     end;
-
-   // If the response is a summerization of a webpage then add it to the coversation history for context
-
-
-   // If 'I found this on the Internet:' is not included in the response do not add AI's response to the conversation it can get big quick..
-   // maybe refine this so it keeps limmited context ??
-   if (Pos('I found this on the Internet:', Response) > 0) then
-  begin
-
-    Response:=Form3.RemoveInternetTags(Response); // delete any internet tags else we could end up dow a rabbit hole of infinite loop
-                                                  // with AI outputting links in summerizations then
-    ParseMarker := Pos('I found this on the Internet:', Response) + Length('I found this on the Internet:');
-    SummerizedText:=Copy(Response, ParseMarker, Length(Response));
-    Conversation:=Conversation+'. '+ SummerizedText;
-  end;
-
-      // Add the AI's response to the chat window
-      Memo1.Lines.Add('AI Assistant: ' + Response);
-      Memo1.Lines.Add('');
-
-      // Check TTS
-   //   if Checkbox4.Checked = True then
-     // begin
-      GlobalResponse:=Response;
-      Timer4.Enabled:=True;
-     // end;
-
-
+      ResponseJSON := IdHTTP1.Post(Edit1.Text, StringStream);
     except
       on E: Exception do
       begin
-      addconvo:=false;
-      if pos('Disconnected.',E.Message)=0 then  // In Case User Clicked Cancel Button Do Not Show Error
+        AddConversation := False;
+        TThread.Synchronize(nil,
+          procedure
+          begin
+            if Pos('Disconnected.', E.Message) = 0 then
+              Memo1.Lines.Add('Error: ' + E.Message);
 
-      begin
-        Memo1.Lines.Add('Error: ' + E.Message);
-        addconvo:=False; // Promt was unlikely to be sent so do not add it to Conversation History
-       // ShowMessage('Error: ' + E.Message);
-       end;
-
-      // Hide "Processing Webpage" Label and  Animated Image
-      Label1.Visible:=False;
-      Image1.Visible:=False;
-
-      //Enabled Send Prompt & New Chat Button & Browser
-      Button1.Enabled:=True;
-      Button2.Enabled:=True;
-      Button6.Visible:=False; // Cancel Button
-      WVWindowParent1.Enabled:=True;
+            Label1.Visible := False;
+            Image1.Visible := False;
+            Button1.Enabled := True;
+            Button2.Enabled := True;
+            Button6.Visible := False;
+            WVWindowParent1.Enabled := True;
+            PendingInternetResponse := '';
+            Memo1.Lines.Add('');
+          end);
+        Exit;
       end;
     end;
   finally
-    Memo1.Lines.Add('');
-    if Memo1.Text <> '' then
-    // update the conversation history
-    if addconvo then
-    begin
-
-      If pos('<Instruction>', Prompt)=0 then
-   Begin
-   Conversation := Conversation +'. '+ Prompt;
-   End;
-    Conversation := JsonEscape(Conversation);
-
-    end;
-    idhttp1.Disconnect;
+    IdHTTP1.Disconnect;
     StringStream.Free;
   end;
+
+  ResponseText := ParseContentFromJSON(ResponseJSON);
+  ResponseText := StringReplace(ResponseText, '</Iinternet>', '</Internet>', [rfReplaceAll]);
+  ResponseText := StringReplace(ResponseText, '<Iinternet>', '<Internet>', [rfReplaceAll]);
+  ResponseText := StringReplace(ResponseText, '<Iternet>', '<Internet>', [rfReplaceAll]);
+  ResponseText := StringReplace(ResponseText, '</Iternet>', '</Internet>', [rfReplaceAll]);
+  ResponseText := StringReplace(ResponseText, '</internet>', '</Internet>', [rfReplaceAll]);
+  ResponseText := StringReplace(ResponseText, '<internet>', '<Internet>', [rfReplaceAll]);
+
+  ResponseForInternet := ResponseText;
+  DisplayResponse := ResponseText;
+
+  ShouldRequestInternet :=
+    (Pos('<Internet>', ResponseForInternet) > 0) and
+    (Pos('</Internet>', ResponseForInternet) > 0) and
+    (Pos('I found this on the Internet:', ResponseForInternet) = 0);
+
+  SummaryText := '';
+  ShouldAddSummary := Pos('I found this on the Internet:', DisplayResponse) > 0;
+  if ShouldAddSummary then
+  begin
+    DisplayResponse := Form3.RemoveInternetTags(DisplayResponse);
+    ParseMarker := Pos('I found this on the Internet:', DisplayResponse) +
+      Length('I found this on the Internet:');
+    SummaryText := Trim(Copy(DisplayResponse, ParseMarker, MaxInt));
+  end;
+
+  TThread.Synchronize(nil,
+    procedure
+    begin
+      Label1.Visible := False;
+      Image1.Visible := False;
+      Button1.Enabled := True;
+      Button2.Enabled := True;
+      Button6.Visible := False;
+      WVWindowParent1.Enabled := True;
+
+      if ShouldRequestInternet then
+      begin
+        PendingInternetResponse := ResponseForInternet;
+        if not PermanentAccess then
+        begin
+          Application.ProcessMessages;
+          Timer2.Enabled := True;
+        end
+        else
+          Timer3.Enabled := True;
+      end;
+
+      Memo1.Lines.Add('AI Assistant: ' + DisplayResponse);
+      Memo1.Lines.Add('');
+      Memo1.Lines.Add('');
+
+      GlobalResponse := DisplayResponse;
+      Timer4.Enabled := True;
+
+      if AddConversation and AddPromptToHistory then
+        AddConversationMessage('user', Prompt);
+
+      if AddConversation and ShouldAddSummary and (SummaryText <> '') then
+        AddConversationMessage('assistant', SummaryText);
+    end);
 end;
 
 //-----------------------------------------------------------------------------
@@ -505,7 +470,9 @@ begin
   Timer2.Enabled:=False;
   PanelVisible:=False;
   Panel2.Visible:=False;
-  GoToURL(GetUrl(GlobalResponse));
+  if PendingInternetResponse <> '' then
+    GoToURL(GetUrl(PendingInternetResponse));
+  PendingInternetResponse := '';
 end;
 //------------------------------------------------------------------------------
 // Access Denied Button CLicked
@@ -521,6 +488,7 @@ begin
   Button1.Enabled:=True;
   Button2.Enabled:=True;
   WVWindowParent1.Enabled:=True;
+  PendingInternetResponse := '';
 end;
 //------------------------------------------------------------------------------
 // Cancel Button
@@ -549,14 +517,14 @@ end;
       Button2.Enabled:=True;
       Button6.Visible:=False; // Cancel Button
       WVWindowParent1.Enabled:=True;
+      PendingInternetResponse := '';
 end;
 
 //-----------------------------------------------------------------------------
 
 procedure TForm1.CheckBox1Click(Sender: TObject);
 begin
- if Checkbox1.checked then PermanentAccess:=True;
- if NOt Checkbox1.checked then PermanentAccess:=True;
+ PermanentAccess := CheckBox1.Checked;
  SaveSettings;
 end;
 //------------------------------------------------------------------------------
@@ -773,7 +741,11 @@ Memo5.Clear;
 Memo6.Clear;
 Memo7.Clear;
 PermanentAccess:=False;
-Conversation:='';
+if ConversationHistory = nil then
+  ConversationHistory := TList<TChatMessage>.Create
+else
+  ConversationHistory.Clear;
+PendingInternetResponse := '';
 MyShowMessage:=True;
 PanelVisible:=False;
 (Image1.Picture.Graphic as TGIFImage).Animate := True;
@@ -999,7 +971,9 @@ end;
 procedure TForm1.Timer3Timer(Sender: TObject);
 begin
 Timer3.Enabled:=False;
-GoToURL(GetUrl(GlobalResponse));
+if PendingInternetResponse <> '' then
+  GoToURL(GetUrl(PendingInternetResponse));
+PendingInternetResponse := '';
 end;
 
 procedure TForm1.Timer4Timer(Sender: TObject);
@@ -1081,7 +1055,9 @@ end;
 procedure TForm1.Button2Click(Sender: TObject);
 begin
 Memo1.Clear;
-Conversation:='';
+if ConversationHistory <> nil then
+  ConversationHistory.Clear;
+PendingInternetResponse := '';
 end;
 
 procedure TForm1.Button3Click(Sender: TObject);
@@ -1203,6 +1179,7 @@ begin
     if length(ServerAddress) < 1 then  ServerAddress := 'http://64.247.196.44:8080/v1/chat/completions';
 
     CheckBox1.Checked := Ini.ReadBool('Settings', 'InternetAccessGranted', False);
+    PermanentAccess := CheckBox1.Checked;
     CheckBox2.Checked := Ini.ReadBool('Settings', 'LocalHost', True);
     CheckBox3.Checked := Ini.ReadBool('Settings', 'AutoSubmitSpeech', False);
     CheckBox4.Checked := Ini.ReadBool('Settings', 'EnableTTS', False);
@@ -1296,6 +1273,13 @@ begin
 
   if (WVBrowser1 <> nil) then
     WVBrowser1.NotifyParentWindowPositionChanged;
+end;
+
+destructor TForm1.Destroy;
+begin
+  ConversationHistory.Free;
+  ConversationHistory := nil;
+  inherited;
 end;
 
 initialization
